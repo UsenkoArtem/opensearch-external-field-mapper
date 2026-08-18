@@ -8,9 +8,8 @@ import dev.evo.persistent.hashmap.straight.StraightHashMapRO_Int_Float
 import dev.evo.persistent.hashmap.straight.StraightHashMapRO_Long_Float
 import dev.evo.persistent.hashmap.straight.StraightHashMapType_Int_Float
 import dev.evo.persistent.hashmap.straight.StraightHashMapType_Long_Float
-
+import org.apache.logging.log4j.LogManager
 import java.nio.file.Path
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 enum class ExternalFieldKeyType {
@@ -28,49 +27,76 @@ interface ExternalFileValues : AutoCloseable {
             AtomicReference<StraightHashMapROEnv<*, *, *>?>(null)
         }
 
+        companion object {
+            private val logger = LogManager.getLogger(Provider::class.java)
+
+            private const val MAX_ATTEMPTS = 3
+        }
+
         fun getValues(keyType: ExternalFieldKeyType, shardId: Int?): ExternalFileValues {
-            val mapEnv = mapEnvs[shardId ?: 0]
-            var env = mapEnv.get()
-            if (env == null) {
+            val mapEnvRef = mapEnvs[shardId ?: 0]
+            repeat(MAX_ATTEMPTS) {
+                val env = mapEnvRef.get()
+                    ?: openEnv(mapEnvRef, keyType, shardId)
+                    ?: return EmptyFileValues
                 try {
-                    val mapDir = if (shardId != null) {
-                        dir.resolve(shardId.toString())
-                    } else {
-                        dir
+                    return when (keyType) {
+                        ExternalFieldKeyType.INT -> {
+                            IntFloatFileValues(
+                                env.getCurrentMap() as StraightHashMapRO_Int_Float
+                            )
+                        }
+
+                        ExternalFieldKeyType.LONG -> {
+                            LongFloatFileValues(
+                                env.getCurrentMap() as StraightHashMapRO_Long_Float
+                            )
+                        }
                     }
-                    val mapEnvBuilder = when(keyType) {
-                        ExternalFieldKeyType.INT -> StraightHashMapEnv.Builder(StraightHashMapType_Int_Float)
-                        ExternalFieldKeyType.LONG -> StraightHashMapEnv.Builder(StraightHashMapType_Long_Float)
-                    }
-                    val bufferManagement = if (useMemorySegments) {
-                        BufferManagement.MemorySegments
-                    } else {
-                        BufferManagement.Unsafe(true)
-                    }
-                    val newEnv = mapEnvBuilder
-                        .bufferManagement(bufferManagement)
-                        .openReadOnly(mapDir)
-                    if (!mapEnv.compareAndSet(null, newEnv)) {
-                        // Another thread already has set an environment
-                        newEnv.close()
-                    }
-                    env = mapEnv.get()!!
                 } catch (e: FileDoesNotExistException) {
-                    return EmptyFileValues
+                    logger.warn(
+                        "Cannot get a current map from $dir, the version file seems to be " +
+                            "replaced, reopening the environment", e
+                    )
+                    mapEnvRef.compareAndSet(env, null)
                 }
             }
-            return when(keyType) {
-                ExternalFieldKeyType.INT -> {
-                    IntFloatFileValues(
-                        env.getCurrentMap() as StraightHashMapRO_Int_Float
-                    )
-                }
-                ExternalFieldKeyType.LONG -> {
-                    LongFloatFileValues(
-                        env.getCurrentMap() as StraightHashMapRO_Long_Float
-                    )
-                }
+            logger.error("Cannot get a current map from $dir after $MAX_ATTEMPTS attempts")
+            return EmptyFileValues
+        }
+
+        private fun openEnv(
+            mapEnvRef: AtomicReference<StraightHashMapROEnv<*, *, *>?>,
+            keyType: ExternalFieldKeyType,
+            shardId: Int?,
+        ): StraightHashMapROEnv<*, *, *>? {
+            val mapDir = if (shardId != null) {
+                dir.resolve(shardId.toString())
+            } else {
+                dir
             }
+            val mapEnvBuilder = when (keyType) {
+                ExternalFieldKeyType.INT -> StraightHashMapEnv.Builder(StraightHashMapType_Int_Float)
+                ExternalFieldKeyType.LONG -> StraightHashMapEnv.Builder(StraightHashMapType_Long_Float)
+            }
+            val bufferManagement = if (useMemorySegments) {
+                BufferManagement.MemorySegments
+            } else {
+                BufferManagement.Unsafe(true)
+            }
+            val newEnv = try {
+                mapEnvBuilder
+                    .bufferManagement(bufferManagement)
+                    .openReadOnly(mapDir)
+            } catch (_: FileDoesNotExistException) {
+                return null
+            }
+            if (mapEnvRef.compareAndSet(null, newEnv)) {
+                return newEnv
+            }
+            // Another thread already has set an environment
+            newEnv.close()
+            return mapEnvRef.get()
         }
 
         override fun close() {
